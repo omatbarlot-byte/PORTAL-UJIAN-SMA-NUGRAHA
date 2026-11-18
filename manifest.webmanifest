@@ -1,0 +1,23 @@
+{
+  "name": "Portal Ujian SMA Nugraha Bandung",
+  "short_name": "CBT Nugraha",
+  "description": "Portal CBT Informatika SMA Nugraha Bandung",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": [
+    "fullscreen",
+    "standalone"
+  ],
+  "orientation": "any",
+  "background_color": "#0B1324",
+  "theme_color": "#0E1830",
+  "icons": [
+    {
+      "src": "logo.png",
+      "sizes": "any",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
