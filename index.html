@@ -86,6 +86,12 @@
   .b-slate{background:rgba(148,163,184,.15);color:#CBD5E1} .b-indigo{background:rgba(79,70,229,.2);color:#A5B4FC}
   .noselect{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
   ::-webkit-scrollbar{width:10px;height:10px} ::-webkit-scrollbar-thumb{background:#2B3A57;border-radius:8px}
+  .dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%}
+  @media (max-width:640px),(pointer:coarse){
+    .glass{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+    .bg-scene::after{display:none}
+    .tilt:hover{box-shadow:none}
+  }
   @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 
   /* =================== TEMA BIRU LANGIT (default) ===================
@@ -163,10 +169,10 @@
    KONFIGURASI
    ===================================================================== */
 const CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/AKfycbznq4-9pZBc2Ogs3_47HwHWEk0W2XXGOIBOt-MKtDTkeqHCnUgZTwpYWdfrp3VQG9Xq/exec',            // <-- tempel URL Web App Apps Script (…/exec). Kosong = MODE DEMO (data lokal)
-  HEARTBEAT_MS: 20000,    // sinkron status ujian ke server
-  LOCKED_POLL_MS: 8000,   // saat terkunci: cek apakah proktor membuka kunci
-  MONITOR_MS: 8000,       // refresh monitoring admin
+  API_URL: 'https://script.google.com/macros/s/AKfycbx26TqOXQfeVTO5Ljto0abKzS8RKzTkM16vhU_9Ct3EKOzvTxfO3ZgTbUCcCTtU17cM/exec',            // <-- tempel URL Web App Apps Script (…/exec). Kosong = MODE DEMO (data lokal)
+  HEARTBEAT_MS: 45000,    // sinkron status ujian ke server (dijarangkan + diacak agar 500 siswa tidak serentak)
+  LOCKED_POLL_MS: 15000,  // saat terkunci: cek apakah proktor membuka kunci
+  MONITOR_MS: 10000,      // refresh monitoring admin
   THEME: 'dark',          // 'dark' = biru malam lembut | 'sky' = biru langit terang
   BG_PHOTO: true,         // true = tampilkan foto sekolah (gambar_sekolah.jpg) sebagai latar
   AI_GUARD: true,         // pantau fokus, ekstensi/asisten AI, PiP, split-screen
@@ -254,15 +260,33 @@ const S = { view: 'gate', token: null, user: null, role: null, schools: [], exam
 const timers = [];
 const clearTimers = () => { while (timers.length) clearInterval(timers.pop()); };
 
+const RETRY_OK = { getSchools: 3, loginSiswa: 3, loginAdmin: 3, getExams: 3, startExam: 4, heartbeat: 2, finishExam: 3, getMonitor: 1 };
+let busyToastAt = 0;
 async function api(action, payload = {}) {
   if (!CONFIG.API_URL) return mockApi(action, payload);
-  const res = await fetch(CONFIG.API_URL, {
-    method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // text/plain => tanpa preflight CORS
-    body: JSON.stringify({ action, token: S.token, ...payload })
-  });
-  const data = await res.json();
-  if (!data.ok) { if (/login ulang|Token tidak ada/i.test(data.error || '')) { forceLogout('Sesi login berakhir.'); } throw new Error(data.error || 'Terjadi kesalahan.'); }
-  return data;
+  const maxTry = (RETRY_OK[action] || 0) + 1;
+  let lastErr;
+  for (let i = 0; i < maxTry; i++) {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 25000);
+    try {
+      const res = await fetch(CONFIG.API_URL, {
+        method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // text/plain => tanpa preflight CORS
+        body: JSON.stringify({ action, token: S.token, ...payload }), signal: ctl.signal
+      });
+      const txt = await res.text(); clearTimeout(to);
+      let data; try { data = JSON.parse(txt); } catch (e) { throw Object.assign(new Error('Server sedang sibuk.'), { retry: true }); }   // halaman error HTML dari Google = server padat
+      if (!data.ok) { if (/login ulang|Token tidak ada/i.test(data.error || '')) forceLogout('Sesi login berakhir.'); throw new Error(data.error || 'Terjadi kesalahan.'); }
+      return data;
+    } catch (e) {
+      clearTimeout(to); lastErr = e;
+      const transient = e.retry || e.name === 'AbortError' || e instanceof TypeError || /sibuk|timeout|too many|terlalu banyak.*server|Service invoked|Spreadsheets/i.test(e.message || '');
+      if (!transient || i === maxTry - 1) break;
+      if (action !== 'heartbeat' && Date.now() - busyToastAt > 6000) { busyToastAt = Date.now(); toast('Server sedang padat, mencoba lagi…', 'info', 3000); }
+      await sleep(Math.min(9000, 700 * 2 ** i) + Math.random() * 900);         // backoff eksponensial + acak
+    }
+  }
+  if (lastErr && (lastErr.name === 'AbortError' || lastErr instanceof TypeError)) throw new Error('Koneksi ke server lambat atau terputus. Coba lagi sebentar.');
+  throw lastErr;
 }
 
 function saveAuth() { sessionStorage.setItem('cbt_auth', JSON.stringify({ token: S.token, user: S.user, role: S.role })); }
@@ -350,7 +374,9 @@ async function viewSiswaLogin() {
       <button class="btn btn-primary w-full" id="go">Masuk</button></form>`);
   $('#back').onclick = () => go('gate'); bindEye(); icons();
   try {
-    const r = await api('getSchools'); S.schools = r.schools;
+    let sc = null; try { const c = JSON.parse(localStorage.getItem('cbt_schools') || 'null'); if (c && Date.now() - c.t < 600000 && c.l.length) sc = c.l; } catch (e) {}
+    if (!sc) { sc = (await api('getSchools')).schools; try { localStorage.setItem('cbt_schools', JSON.stringify({ t: Date.now(), l: sc })); } catch (e) {} }
+    const r = { schools: sc }; S.schools = r.schools;
     if (r.schools.length) $('#school').innerHTML = '<option value="">— Pilih sekolah —</option>' + r.schools.map(s => `<option>${esc(s)}</option>`).join('');
     else { schoolAsText(); setErr('Daftar sekolah kosong. Ketik nama sekolah persis seperti di sheet "Siswa". Admin: periksa sheet Siswa (buka alamat /exec?debug=1 untuk diagnosa).'); }
   } catch (e) { schoolAsText(); setErr('Daftar sekolah gagal dimuat (' + e.message + '). Ketik nama sekolah secara manual, atau muat ulang halaman.'); }
@@ -359,7 +385,7 @@ async function viewSiswaLogin() {
     const btn = $('#go'); busy(btn, true);
     try {
       const r = await api('loginSiswa', { school: $('#school').value, nomor: $('#nomor').value.trim(), password: $('#pass').value });
-      S.token = r.token; S.user = r.user; S.role = 'siswa'; S.exams = r.exams; saveAuth(); go('siswaDash');
+      S.token = r.token; S.user = r.user; S.role = 'siswa'; S.exams = r.exams; S.examsAt = Date.now(); saveAuth(); go('siswaDash');
     } catch (e) { setErr(e.message); busy(btn, false, 'Masuk'); }
   };
 }
@@ -418,7 +444,7 @@ async function viewSiswaDash() {
   $('#agree').onchange = syncStart;
   $('#start').onclick = () => beginExam(S.pick);
   bindInstall();
-  S.pick = null; await loadStudentExams(); icons();
+  S.pick = null; await loadStudentExams(false); icons();
 }
 
 function installSteps() {
@@ -448,10 +474,10 @@ function showInstallGuide() {
     actions: [{ label: 'Mengerti', cls: 'btn-primary' }] });
 }
 
-async function loadStudentExams() {
+async function loadStudentExams(force = true) {
   const box = $('#exams'); if (!box) return;
   box.innerHTML = `<div class="flex items-center gap-2 text-sm text-slate-400">${ic('loader-2', 'w-4 h-4 spin')} Mengambil data terbaru…</div>`; icons();
-  try { S.exams = (await api('getExams')).exams; } catch (e) { box.innerHTML = `<div class="text-sm text-red-300">${esc(e.message)}</div>`; return; }
+  try { if (force || !S.examsAt || Date.now() - S.examsAt > 20000) { S.exams = (await api('getExams')).exams; S.examsAt = Date.now(); } } catch (e) { box.innerHTML = `<div class="text-sm text-red-300">${esc(e.message)}</div>`; return; }
   if (!S.exams.length) { box.innerHTML = `<div class="rounded-xl border border-dashed border-slate-600 p-6 text-center text-sm text-slate-400">Belum ada ujian aktif untuk sekolah Anda. Tunggu instruksi proktor lalu tekan Perbarui.</div>`; S.pick = null; syncStart(); return; }
   if (!S.exams.find(e => e.id === S.pick)) S.pick = S.exams.length === 1 ? S.exams[0].id : null;
   box.innerHTML = S.exams.map(e => {
@@ -507,7 +533,7 @@ async function beginExam(examId, resume = false) {
     if (resume) violation('reload', 'Halaman dimuat ulang saat ujian');
   }
   X.timers.push(setInterval(tick, 500));
-  X.timers.push(setInterval(heartbeat, CONFIG.HEARTBEAT_MS));
+  X.timers.push(setTimeout(() => { if (X) X.timers.push(setInterval(heartbeat, CONFIG.HEARTBEAT_MS)); }, Math.random() * CONFIG.HEARTBEAT_MS));   // mulai acak agar tidak serentak
   X.timers.push(setInterval(() => { if (X.state === 'locked') heartbeat(); }, CONFIG.LOCKED_POLL_MS));
 }
 
@@ -643,7 +669,7 @@ function attachAIGuards(on) {
     if (AI_RE.test(sig)) { X.aiSeen = true; violation('ai-ext', 'Ekstensi / asisten AI terdeteksi di halaman'); }
   };
   document.querySelectorAll('body *, html > *').forEach(scan);
-  const mo = new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(n => { scan(n); n.querySelectorAll && n.querySelectorAll('*').forEach(scan); })));
+  const mo = new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(n => { if (n.nodeType !== 1 || ours(n)) return; scan(n); n.querySelectorAll('*').forEach(scan); })));
   mo.observe(document.documentElement, { childList: true, subtree: true });
   X.off.push(() => mo.disconnect());
 
@@ -770,28 +796,34 @@ function panelMonitor() {
     <section class="glass rounded-3xl p-6"><div class="mb-4 flex flex-wrap items-center justify-between gap-3"><h3 class="flex items-center gap-2 font-bold text-white"><span class="pulse"></span> Monitoring real-time</h3>
       <div class="flex gap-2"><select id="flt" class="input !w-auto !py-2 text-sm"><option value="">Semua ujian</option>${S.exams.map(e => `<option value="${esc(e.id)}" ${A.filter === e.id ? 'selected' : ''}>${esc(e.name)} — ${esc(e.school)}</option>`).join('')}</select>
       <button id="unlockAll" class="btn btn-green px-3 text-xs">${ic('lock-open', 'w-3.5 h-3.5')} Buka semua kunci</button><button id="rl" class="btn btn-ghost px-3 text-xs">${ic('refresh-cw', 'w-3.5 h-3.5')}</button></div></div>
-    <div class="overflow-x-auto"><table class="tbl"><thead><tr><th>Siswa</th><th>Kelas</th><th>Ujian</th><th>Pelanggaran</th><th>Status</th><th>Aktif terakhir</th><th>Sisa waktu</th><th></th></tr></thead><tbody id="mrows"></tbody></table></div></section>`;
+    <div class="mb-3 flex flex-wrap gap-2"><input id="q" class="input !w-auto min-w-[12rem] flex-1 !py-2 text-sm" placeholder="Cari nama / nomor peserta…" value="${esc(A.q || '')}"><select id="stf" class="input !w-auto !py-2 text-sm"><option value="">Semua status</option><option>Sedang Mengerjakan</option><option>Terkunci</option><option>Selesai</option></select></div>
+    <div class="overflow-x-auto"><table class="tbl"><thead><tr><th>Siswa</th><th>Kelas</th><th>Ujian</th><th>Pelanggaran</th><th>Status</th><th>Aktif terakhir</th><th>Sisa waktu</th><th></th></tr></thead><tbody id="mrows"></tbody></table></div><div id="more" class="mt-3 text-center"></div></section>`;
+  A.limit = 100; A.stf = A.stf || '';
+  let qt; $('#q').oninput = e => { clearTimeout(qt); qt = setTimeout(() => { A.q = e.target.value.trim().toLowerCase(); A.limit = 100; drawMonitor(); }, 250); };
+  $('#stf').value = A.stf; $('#stf').onchange = e => { A.stf = e.target.value; A.limit = 100; drawMonitor(); };
   $('#flt').onchange = e => { A.filter = e.target.value; loadMonitor(); };
   $('#rl').onclick = loadMonitor; $('#unlockAll').onclick = () => unlockModal({ all: true }); loadMonitor(); icons();
-  timers.push(setInterval(loadMonitor, CONFIG.MONITOR_MS));
+  timers.push(setInterval(() => { if (!document.hidden) loadMonitor(); }, CONFIG.MONITOR_MS));
 }
 async function loadMonitor() {
-  try { const r = await api('getMonitor', { examId: A.filter || undefined }); A.sessions = r.sessions; A.serverNow = r.serverNow; drawMonitor(); } catch (e) { toast(e.message, 'err'); }
+  try { const r = await api('getMonitor', { examId: A.filter || undefined }); A.sessions = r.sessions; A.serverNow = r.serverNow; drawMonitor(); } catch (e) { if (Date.now() - (A.errAt || 0) > 30000) { A.errAt = Date.now(); toast(e.message, 'err'); } }
 }
 function drawMonitor() {
   const L = A.sessions, tb = $('#mrows'); if (!tb) return;
+  const F = L.filter(s => (!A.stf || s.status === A.stf) && (!A.q || (s.nama + ' ' + s.nomor).toLowerCase().includes(A.q))), V = F.slice(0, A.limit || 100);
   const c = { run: L.filter(s => s.status === 'Sedang Mengerjakan').length, lock: L.filter(s => s.status === 'Terkunci').length, done: L.filter(s => s.status === 'Selesai').length };
   $('#stats').innerHTML = [['Total peserta', L.length, 'users', 'text-slate-200'], ['Mengerjakan', c.run, 'pencil-line', 'text-indigo-300'], ['Terkunci', c.lock, 'lock', 'text-red-300'], ['Selesai', c.done, 'check-circle-2', 'text-emerald-300']]
     .map(x => `<div class="glass rounded-2xl p-4"><div class="flex items-center gap-2 text-xs text-slate-400">${ic(x[2], 'w-4 h-4')} ${x[0]}</div><div class="mt-1 text-3xl font-extrabold ${x[3]}">${x[1]}</div></div>`).join('');
-  tb.innerHTML = L.length ? L.map(s => {
+  tb.innerHTML = V.length ? V.map(s => {
     const b = s.status === 'Terkunci' ? 'b-red' : s.status === 'Selesai' ? 'b-green' : 'b-indigo';
-    return `<tr><td><div class="flex items-center gap-2"><span class="pulse" style="--c:${s.online ? '#10B981' : '#64748B'}"></span><div><div class="font-semibold text-white">${esc(s.nama)}</div><div class="text-xs text-slate-500">${esc(s.nomor)}${s.school ? ' · ' + esc(s.school) : ''}</div></div></div></td>
+    return `<tr><td><div class="flex items-center gap-2"><span class="dot" style="background:${s.online ? '#10B981' : '#64748B'}"></span><div><div class="font-semibold text-white">${esc(s.nama)}</div><div class="text-xs text-slate-500">${esc(s.nomor)}${s.school ? ' · ' + esc(s.school) : ''}</div></div></div></td>
       <td>${esc(s.kelas)}</td><td class="max-w-[12rem] truncate">${esc(s.examName)}</td><td><span class="badge ${s.violations ? 'b-red' : 'b-slate'}">${s.violations}</span></td>
       <td><span class="badge ${b}">${esc(s.status)}</span>${s.note ? `<div class="mt-0.5 max-w-[14rem] truncate text-[11px] text-slate-500" title="${esc(s.note)}">${esc(s.note)}</div>` : ''}</td><td class="text-slate-400">${fmtClock(s.last)}</td><td class="whitespace-nowrap tabular-nums ${s.end - A.serverNow <= 0 ? 'text-red-300' : 'text-slate-300'}">${remain(s)}</td>
-      <td class="whitespace-nowrap text-right">${s.status !== 'Sedang Mengerjakan' ? `<button data-op="unlock" data-id="${s.id}" class="btn ${s.status === 'Terkunci' ? 'btn-green' : 'btn-ghost'} px-2.5 py-1.5 text-xs">${ic('lock-open', 'w-3.5 h-3.5')} ${s.status === 'Terkunci' ? 'Buka kunci' : 'Buka lagi'}</button>` : ''}
-        ${s.status === 'Sedang Mengerjakan' ? `<button data-op="lock" data-id="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs text-red-300">${ic('lock', 'w-3.5 h-3.5')}</button><button data-op="finish" data-id="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs">${ic('flag', 'w-3.5 h-3.5')}</button>` : ''}
-        <button data-log="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs" title="Lihat log">${ic('scroll-text', 'w-3.5 h-3.5')}</button></td></tr>`;
-  }).join('') : `<tr><td colspan="8" class="py-10 text-center text-slate-500">Belum ada siswa yang memulai ujian.</td></tr>`;
+      <td class="whitespace-nowrap text-right">${s.status !== 'Sedang Mengerjakan' ? `<button data-op="unlock" data-id="${s.id}" class="btn ${s.status === 'Terkunci' ? 'btn-green' : 'btn-ghost'} px-2.5 py-1.5 text-xs">${s.status === 'Terkunci' ? 'Buka kunci' : 'Buka lagi'}</button>` : ''}
+        ${s.status === 'Sedang Mengerjakan' ? `<button data-op="lock" data-id="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs text-red-300">Kunci</button><button data-op="finish" data-id="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs">Selesai</button>` : ''}
+        <button data-log="${s.id}" class="btn btn-ghost px-2.5 py-1.5 text-xs" title="Lihat log">Log</button></td></tr>`;
+  }).join('') : `<tr><td colspan="8" class="py-10 text-center text-slate-500">${L.length ? 'Tidak ada hasil untuk filter ini.' : 'Belum ada siswa yang memulai ujian.'}</td></tr>`;
+  const more = $('#more'); if (more) { more.innerHTML = F.length > V.length ? `<button id="moreb" class="btn btn-ghost text-sm">Tampilkan 100 lagi (${V.length} dari ${F.length})</button>` : (F.length > 100 ? `<span class="text-xs text-slate-500">Menampilkan semua ${F.length} peserta</span>` : ''); const mb = $('#moreb'); if (mb) mb.onclick = () => { A.limit += 100; drawMonitor(); }; }
   tb.querySelectorAll('[data-op]').forEach(b => b.onclick = async () => {
     if (b.dataset.op === 'unlock') { const s = A.sessions.find(x => x.id === b.dataset.id); return unlockModal({ id: s.id, nama: s.nama }); }
     const names = { lock: 'Kunci', finish: 'Selesaikan' };
