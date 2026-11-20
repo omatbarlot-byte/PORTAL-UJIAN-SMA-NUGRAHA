@@ -36,6 +36,7 @@ var TOKEN_TTL = 6 * 60 * 60;        // detik
 var SES_TTL = 6 * 60 * 60;          // detik (maks CacheService)
 var ONLINE_WINDOW_MS = 100 * 1000;  // online jika heartbeat < 100 detik
 var MAX_LOGIN_FAIL = 5;
+var GRACE_MS = 120 * 1000;          // masa tenggang setelah waktu habis (harus > CONFIG.SUBMIT_GRACE_SEC di index.html)
 var TTL_STUDENTS = 600, TTL_GURU = 600, TTL_EXAM = 15, TTL_SCHOOLS = 300, TTL_MON = 6;
 
 /* ----------------------------- Router ------------------------------ */
@@ -338,7 +339,7 @@ function ownSes_(req, u) {
   return s;
 }
 function expire_(s) {
-  if (s.status === ST.RUN && Date.now() > s.end + 3000) {
+  if (s.status === ST.RUN && Date.now() > s.end + GRACE_MS) {
     s.status = ST.DONE; s.finishedAt = nowStr_(); s.note = 'Waktu habis';
     putSes_(s);
   }
@@ -461,7 +462,7 @@ function listExamsForStudent_(user) {
   var m = getAllCache_(keys), now = Date.now();
   return rows.map(function (r, i) {
     var e = examOut_(r, false), raw = m[keys[i]], st = null;
-    if (raw) { var s = JSON.parse(raw); st = s.status; if (st === ST.RUN && now > s.end + 3000) st = ST.DONE; }
+    if (raw) { var s = JSON.parse(raw); st = s.status; if (st === ST.RUN && now > s.end + GRACE_MS) st = ST.DONE; }
     e.myStatus = st;
     return e;
   });
@@ -593,7 +594,7 @@ function getMonitor_(req) {
     return canSchool_(u, s.school) && (!req.examId || s.examId === req.examId);
   }).map(function (s) {
     var st = s.status, note = s.note;
-    if (st === ST.RUN && now > s.end + 3000) { st = ST.DONE; note = 'Waktu habis'; }
+    if (st === ST.RUN && now > s.end + GRACE_MS) { st = ST.DONE; note = 'Waktu habis'; }
     return {
       id: s.id, school: s.school, nomor: s.nomor, nama: s.nama, kelas: s.kelas, examId: s.examId, examName: s.examName,
       violations: s.violations, status: st, last: s.last, end: s.end, note: note,

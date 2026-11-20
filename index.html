@@ -68,6 +68,8 @@
   @keyframes ping{75%,100%{transform:scale(2.8);opacity:0}}
   .blink-red{animation:blink 1s steps(2,start) infinite;color:#fff;background:var(--red)!important}
   @keyframes blink{50%{opacity:.35}}
+  .blink-soft{animation:softblink 1s ease-in-out infinite}
+  @keyframes softblink{50%{opacity:.7}}
   .shake{animation:shake .5s}
   @keyframes shake{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
   .enter{animation:enter .45s cubic-bezier(.2,.8,.2,1) both}
@@ -169,7 +171,7 @@
    KONFIGURASI
    ===================================================================== */
 const CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/AKfycbx26TqOXQfeVTO5Ljto0abKzS8RKzTkM16vhU_9Ct3EKOzvTxfO3ZgTbUCcCTtU17cM/exec',            // <-- tempel URL Web App Apps Script (…/exec). Kosong = MODE DEMO (data lokal)
+  API_URL: 'https://script.google.com/macros/s/AKfycbyQZtkImp91p0hY6OKRzVTHtcpvYg752Bqxks0iwG-v9aW2rF4HwcR8Th3p12cAbehv/exec',            // <-- tempel URL Web App Apps Script (…/exec). Kosong = MODE DEMO (data lokal)
   HEARTBEAT_MS: 45000,    // sinkron status ujian ke server (dijarangkan + diacak agar 500 siswa tidak serentak)
   LOCKED_POLL_MS: 15000,  // saat terkunci: cek apakah proktor membuka kunci
   MONITOR_MS: 10000,      // refresh monitoring admin
@@ -182,6 +184,8 @@ const CONFIG = {
     FULLSCREEN: 'disarankan', // HP/tablet tanpa layar penuh: 'disarankan' = boleh lanjut | 'wajib' = harus dipasang ke Layar Utama (PWA) dulu
     ORIENTATION: 'any'        // kunci orientasi saat ujian: 'any' | 'portrait' (tegak) | 'landscape' (mendatar) - hanya Android/Chrome
   },
+  SUBMIT_GRACE_SEC: 90,   // waktu tambahan setelah timer habis untuk menekan KIRIM pada formulir (harus lebih kecil dari GRACE_MS di Code.gs = 120 dtk). 0 = langsung terkunci
+  WARN_MINUTES: [5, 1],   // peringatan 'segera tekan Kirim' pada sisa waktu (menit)
   KEEP_AWAKE: true,       // cegah layar mati/redup saat ujian (Wake Lock)
   ALLOW_MOBILE: true      // true = HP/tablet boleh ujian (tanpa layar penuh jika tidak didukung). false = wajib laptop/PC
 };
@@ -416,7 +420,8 @@ const RULES = [
   'Dilarang membuka Google Gemini, ChatGPT, Copilot, atau AI lain di tab, aplikasi, panel samping, maupun perangkat lain. Perpindahan fokus dan aplikasi AI yang terdeteksi dicatat sebagai pelanggaran.',
   'Jika pelanggaran mencapai batas, ujian terkunci otomatis dan hanya proktor yang dapat membukanya.',
   'Pelanggaran tersimpan di server. Memuat ulang halaman tidak mereset hitungan.',
-  'Setelah selesai, tekan Kirim pada formulir, lalu tekan Selesai Ujian.'
+  'Setelah selesai, tekan Kirim pada formulir, lalu tekan Selesai Ujian.',
+  `Formulir tidak dapat dikirim otomatis oleh sistem. Saat waktu habis Anda diberi ${CONFIG.SUBMIT_GRACE_SEC} detik untuk menekan Kirim, setelah itu layar terkunci. Tekan Kirim sebelum waktu habis.`
 ];
 
 async function viewSiswaDash() {
@@ -547,16 +552,41 @@ function renderExam() {
       <div id="timer" class="flex items-center gap-2 rounded-xl bg-slate-800 px-2.5 py-1 font-mono text-base font-bold tabular-nums text-white sm:px-3 sm:py-1.5 sm:text-lg">${ic('timer', 'w-4 h-4')}<span id="tv">--:--</span></div>
       <button id="finish" class="btn btn-red px-4 py-2 text-sm">${ic('flag', 'w-4 h-4')} <span class="hidden sm:inline">Selesai Ujian</span><span class="sm:hidden">Selesai</span></button>
     </header>
+    <div id="sb" class="hidden" role="alert" style="color:#fff;text-align:center;font-weight:700;padding:.6rem 1rem;font-size:.9rem"></div>
     <main class="relative flex-1 bg-white">${X.link ? `<iframe id="frm" title="Formulir ujian" class="absolute inset-0 h-full w-full border-0" src="${esc(X.link)}" referrerpolicy="no-referrer" allow="fullscreen">Memuat…</iframe>` : ''}</main></div>`;
   $('#finish').onclick = confirmFinish; icons(); tick();
 }
 
+function banner(text, tone) {
+  const el = $('#sb'); if (!el) return;
+  el.style.background = tone === 'red' ? '#DC2626' : '#B45309';
+  el.className = tone === 'red' ? 'blink-soft' : ''; el.textContent = text;
+}
+function alertUser() {
+  try { navigator.vibrate && navigator.vibrate([250, 120, 250]); } catch (e) {}
+  try { const A = new (window.AudioContext || window.webkitAudioContext)(), o = A.createOscillator(), g = A.createGain(); o.connect(g); g.connect(A.destination); o.frequency.value = 880; g.gain.value = .08; o.start(); setTimeout(() => { o.stop(); A.close(); }, 350); } catch (e) {}
+}
 function tick() {
   if (!X || X.state !== 'run') return;
   const left = (X.endsAt - (Date.now() + X.offset)) / 1000;
   const tv = $('#tv'); if (tv) tv.textContent = fmtTime(left);
   const t = $('#timer'); if (t) t.classList.toggle('blink-red', left < 300);
-  if (left <= 0) timeUp();
+  if (left <= 0) {
+    const grace = Math.max(0, +CONFIG.SUBMIT_GRACE_SEC || 0);
+    const gl = (X.endsAt + grace * 1000 - (Date.now() + X.offset)) / 1000;     // dihitung dari jam server, reload tidak memperpanjang
+    if (gl <= 0) return timeUp();
+    if (!X.grace) { X.grace = true; alertUser(); $('#warn')?.remove(); }
+    banner(`WAKTU HABIS! Tekan tombol KIRIM pada formulir SEKARANG. Layar terkunci otomatis dalam ${Math.ceil(gl)} detik.`, 'red');
+    return;
+  }
+  X.warned = X.warned || {};
+  (CONFIG.WARN_MINUTES || []).forEach(m => {
+    if (left <= m * 60 && !X.warned[m]) {
+      X.warned[m] = true; alertUser();
+      banner(`Sisa waktu ${m} menit. Periksa jawaban Anda, lalu tekan tombol KIRIM di bagian bawah formulir.`, m <= 1 ? 'red' : 'amber');
+      toast(`Sisa waktu ${m} menit. Segera tekan Kirim.`, 'err', 6000);
+    }
+  });
 }
 function updBadge() {
   const b = $('#vbadge'); if (!b) return; $('#vn').textContent = X.v;
@@ -590,7 +620,7 @@ async function flushPending() {
 
 /* ---- pelanggaran ---- */
 function violation(type, label) {
-  if (!X || X.state !== 'run') return;
+  if (!X || X.state !== 'run' || X.grace) return;       // saat masa tenggang kirim, pelanggaran tidak dihitung
   const now = Date.now(); if (now - X.lastV < 1500) return; X.lastV = now;   // cegah hitung ganda (blur + visibilitychange)
   X.v++; updBadge();
   const n = X.v, lock = n >= X.max;
@@ -702,7 +732,7 @@ function showLockout(kind) {
   el.className = 'pointer-events-auto fixed inset-0 z-[99] flex items-center justify-center p-6 text-center ' + (cheat ? 'bg-red-950' : 'bg-slate-950');
   el.innerHTML = `<div class="enter max-w-lg"><div class="mx-auto mb-6 grid h-24 w-24 place-items-center rounded-full ${cheat ? 'bg-red-500/20 text-red-300 danger-glow' : 'bg-amber-500/15 text-amber-300'}">${ic(cheat ? 'lock' : 'hourglass', 'w-12 h-12')}</div>
     <h1 class="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">${cheat ? 'UJIAN TERKUNCI!' : 'WAKTU HABIS'}</h1>
-    <p class="mt-4 text-base leading-relaxed text-slate-200">${cheat ? 'Anda telah melebihi batas kecurangan yang diizinkan. Silakan hubungi proktor/pengawas ujian.' : 'Waktu ujian Anda telah berakhir. Jawaban yang sudah Anda kirim lewat formulir tersimpan.'}</p>
+    <p class="mt-4 text-base leading-relaxed text-slate-200">${cheat ? 'Anda telah melebihi batas kecurangan yang diizinkan. Silakan hubungi proktor/pengawas ujian.' : 'Waktu ujian telah berakhir. Jawaban yang sudah Anda kirim lewat tombol Kirim pada formulir tersimpan. Jawaban yang belum dikirim tidak dapat diterima.'}</p>
     ${cheat ? `<div class="mt-5 inline-flex items-center gap-2 rounded-full bg-black/30 px-4 py-2 text-xs text-red-200"><span class="pulse" style="--c:#F87171"></span> Menunggu proktor… halaman ini akan terbuka otomatis jika kunci dilepas</div>` : ''}
     <div class="mt-8"><button id="lockout-out" class="btn btn-ghost">${ic('log-out', 'w-4 h-4')} Keluar</button></div></div>`;
   $('#layer').appendChild(el); icons(); $('#lockout-out').onclick = () => logout(true);
